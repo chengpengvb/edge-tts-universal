@@ -64,6 +64,7 @@ export class EdgeTTS {
   public rate: string;
   public volume: string;
   public pitch: string;
+  public timeout?: number;
 
   /**
    * @param text The text to be synthesized.
@@ -73,13 +74,14 @@ export class EdgeTTS {
   constructor(
     text: string,
     voice = "Microsoft Server Speech Text to Speech Voice (zh-CN, XiaoxiaoNeural)",
-    options: ProsodyOptions = {}
+    options: ProsodyOptions & { timeout?: number } = {}
   ) {
     this.text = text;
     this.voice = voice;
     this.rate = options.rate || "+0%";
     this.volume = options.volume || "+0%";
     this.pitch = options.pitch || "+0Hz";
+    this.timeout = options.timeout;
   }
 
   /**
@@ -92,6 +94,8 @@ export class EdgeTTS {
       rate: this.rate,
       volume: this.volume,
       pitch: this.pitch,
+      timeout: this.timeout,
+      connectionTimeout: this.timeout,
     });
 
     const audioChunks: Buffer[] = [];

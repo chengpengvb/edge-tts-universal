@@ -43,6 +43,8 @@ export interface CommunicateOptions {
   proxy?: string;
   /** WebSocket connection timeout in milliseconds */
   connectionTimeout?: number;
+  /** Maximum synthesis time (end-to-end) in milliseconds */
+  timeout?: number;
 }
 
 /**
@@ -66,6 +68,8 @@ export class Communicate {
   private readonly texts: Generator<Buffer>;
   private readonly proxy?: string;
   private readonly connectionTimeout?: number;
+  private readonly timeout?: number;
+  private deadlineMs: number | null = null;
 
   private state: CommunicateState = {
     partialText: Buffer.from(''),
@@ -100,6 +104,7 @@ export class Communicate {
 
     this.proxy = options.proxy;
     this.connectionTimeout = options.connectionTimeout;
+    this.timeout = options.timeout;
   }
 
   private parseMetadata(data: Buffer): TTSChunk {
@@ -125,6 +130,13 @@ export class Communicate {
   }
 
   private async * _stream(): AsyncGenerator<TTSChunk, void, unknown> {
+    let remainingMs: number | null = null;
+    if (this.deadlineMs != null) {
+      remainingMs = this.deadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        throw new WebSocketError('Synthesis timeout');
+      }
+    }
     const url = `${WSS_URL}&Sec-MS-GEC=${DRM.generateSecMsGec()}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}&ConnectionId=${connectId()}`;
 
     let agent: any;
@@ -151,6 +163,32 @@ export class Communicate {
 
     const messageQueue: (TTSChunk | Error | 'close')[] = [];
     let resolveMessage: (() => void) | null = null;
+    let overallTimeoutId: ReturnType<typeof setTimeout> | null = null;
+    let rejectOpen: ((error: Error) => void) | null = null;
+
+    const closeWebSocket = (): void => {
+      const anyWebSocket = websocket as unknown as { terminate?: () => void };
+      if (typeof anyWebSocket.terminate === 'function') {
+        anyWebSocket.terminate();
+        return;
+      }
+      websocket.close();
+    };
+
+    if (remainingMs != null) {
+      overallTimeoutId = setTimeout(() => {
+        const error = new WebSocketError('Synthesis timeout');
+        messageQueue.push(error);
+        closeWebSocket();
+        if (rejectOpen != null) {
+          rejectOpen(error);
+          rejectOpen = null;
+        }
+        if (resolveMessage) {
+          resolveMessage();
+        }
+      }, remainingMs);
+    }
 
     websocket.on('message', (message: Buffer, isBinary: boolean) => {
       if (!isBinary) {
@@ -206,16 +244,46 @@ export class Communicate {
     });
 
     websocket.on('error', (error) => {
+      if (overallTimeoutId != null) {
+        clearTimeout(overallTimeoutId);
+        overallTimeoutId = null;
+      }
       messageQueue.push(new WebSocketError(error.message));
       if (resolveMessage) resolveMessage();
     });
 
     websocket.on('close', () => {
+      if (overallTimeoutId != null) {
+        clearTimeout(overallTimeoutId);
+        overallTimeoutId = null;
+      }
       messageQueue.push('close');
       if (resolveMessage) resolveMessage();
     });
 
-    await new Promise<void>(resolve => websocket.on('open', resolve));
+    await new Promise<void>((resolve, reject) => {
+      const onClose = (): void => {
+        reject(new WebSocketError('WebSocket closed before open'));
+      };
+      const onError = (error: unknown): void => {
+        if (error != null && typeof error === 'object' && 'message' in error) {
+          reject(new WebSocketError(String((error as { message: unknown }).message)));
+          return;
+        }
+        reject(new WebSocketError('WebSocket error'));
+      };
+      const onOpen = (): void => {
+        websocket.removeListener('close', onClose);
+        websocket.removeListener('error', onError as any);
+        rejectOpen = null;
+        resolve();
+      };
+
+      rejectOpen = reject;
+      websocket.once('close', onClose);
+      websocket.once('error', onError as any);
+      websocket.once('open', onOpen);
+    });
 
     websocket.send(
       `X-Timestamp:${dateToString()}\r\n`
@@ -245,6 +313,11 @@ export class Communicate {
           }
           break;
         } else if (message instanceof Error) {
+          if (overallTimeoutId != null) {
+            clearTimeout(overallTimeoutId);
+            overallTimeoutId = null;
+          }
+          closeWebSocket();
           throw message;
         } else {
           if (message.type === 'audio') audioWasReceived = true;
@@ -258,6 +331,10 @@ export class Communicate {
           setTimeout(resolve, 50);
         });
       }
+    }
+    if (overallTimeoutId != null) {
+      clearTimeout(overallTimeoutId);
+      overallTimeoutId = null;
     }
   }
 
@@ -288,6 +365,12 @@ export class Communicate {
       throw new Error('stream can only be called once.');
     }
     this.state.streamWasCalled = true;
+
+    if (this.timeout != null) {
+      this.deadlineMs = Date.now() + this.timeout;
+    } else {
+      this.deadlineMs = null;
+    }
 
     for (const partialText of this.texts) {
       this.state.partialText = partialText;
